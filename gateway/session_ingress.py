@@ -231,6 +231,8 @@ def row_turn_author(policy, row):
 
 
 async def execute_admission(authority, ref, row):
+    from gateway.voice_requests import request_for_row, _executing, LiveRequestRefused
+    live_voice_request = request_for_row(authority, ref, row)
     from gateway.session_completion_notes import note_if_unviewed
     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
     if noted is not None:
@@ -244,6 +246,8 @@ async def execute_admission(authority, ref, row):
     from gateway.session_managed_worker import managed_policy, admit_managed
     policy = managed_policy(authority, ref)
     if policy is not None:
+        if live_voice_request is not None:
+            raise LiveRequestRefused("live_voice_managed_worker_not_supported")
         return await admit_managed(authority, ref, row, policy)
     live = authority.sessions[ref.session_id]
     native = row['admission_id'] in authority.native_waiters
@@ -286,6 +290,7 @@ async def execute_admission(authority, ref, row):
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
     event._turn_marker_handoff = True
     handed = False
+    live_voice_token = _executing.set(live_voice_request)  # clear inherited context for other turns
     try:
         async with _admission_scope(authority, home, row, event, captured):
             if is_api:
@@ -317,7 +322,7 @@ async def execute_admission(authority, ref, row):
             authority.pending_results[row['admission_id']] = {
                 'result': result, 'usage': captured.get('usage', {}),
                 **({'session_usage': captured['session_usage']} if 'session_usage' in captured else {})}
-            if not is_api and response:
+            if not is_api and live_voice_request is None and response:
                 adapter = authority.runner._adapter_for_source(event.source)
                 if adapter is not None:
                     # A recovered turn with no live delivery waiter: the drain sends this only after
@@ -340,6 +345,7 @@ async def execute_admission(authority, ref, row):
         api_execution.reset(api_token)
         admission_author.reset(author_token)
         viewer_turn.reset(viewer_token)
+        _executing.reset(live_voice_token)
 
 
 def _launch_body_if_launch_owner(authority):

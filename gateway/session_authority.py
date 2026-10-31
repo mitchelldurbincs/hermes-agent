@@ -552,6 +552,9 @@ class SessionAuthority:
         import json
         from gateway.session_envelope import prepare_native, restore_native_source
         self._require_admission_open()
+        from gateway.voice_requests import request_for_event
+        if live_voice_request := request_for_event(event):
+            live_voice_request.validate_admitted(event)
         payload = await prepare_native(self.runner, event)
         if fingerprint := getattr(event, '_ingress_sha256', None):
             payload['native_text_v1']['ingress_sha256'] = fingerprint  # the delivery before a rewrite
@@ -613,6 +616,8 @@ class SessionAuthority:
         return current if current in self.sessions else session_id
 
     def _admitted(self, ref, event, row):
+        from gateway.voice_requests import committed
+        committed(self, ref, event, row)
         if event is not None:
             event._gateway_accepted = True
             if row['status'] == 'queued' and (committed := getattr(event, '_on_commit', None)) is not None:

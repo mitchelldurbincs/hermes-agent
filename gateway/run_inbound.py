@@ -1247,10 +1247,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.voice_requests import request_for_event
+        _live_voice_request = request_for_event(event)
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        if _live_voice_request is not None:
+            _live_voice_request.validate_admitted(event)  # after normal authorization, before controls/admission
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)

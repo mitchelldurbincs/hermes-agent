@@ -32,6 +32,14 @@ _VOICE_MODES = {"off", "voice_only", "all"}
 
 
 class GatewayVoiceMixin:
+    def inspect_live_voice_binding(self, adapter, *, binding):
+        from gateway.voice_requests import inspect_binding
+        return inspect_binding(self, adapter, binding)
+
+    def prepare_live_voice_request(self, adapter, **kwargs):
+        from gateway.voice_requests import prepare_request
+        return prepare_request(self, adapter, **kwargs)
+
     def _voice_key(self, platform: Platform, chat_id: str, profile: Optional[str] = None) -> str:
         """``<profile>:<platform>:<chat_id>`` under multiplexing (else two bots in one channel
         share a key and one ``/voice`` flips the other's); default keeps ``<platform>:<chat>``.

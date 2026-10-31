@@ -203,6 +203,9 @@ class GatewayTurnPersistenceMixin:
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
         requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
+        from gateway.voice_requests import executing_for
+        if executing_for(source):
+            return response
         if source.platform == Platform.LOCAL and not _acp_launch(self, source):
             # Local viewers receive reasoning.delta through their event stream; projecting it into
             # the final response duplicates it and leaks messaging-platform formatting into Desktop.
@@ -613,6 +616,9 @@ class GatewayTurnPersistenceMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        from gateway.voice_requests import executing_for
+        if executing_for(source):
+            return "" if _intentional_silence else response  # result returned through durable receipt
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).

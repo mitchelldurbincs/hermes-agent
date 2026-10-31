@@ -710,7 +710,10 @@ class VoiceReceiver:
     CHANNELS = 2               # Discord sends stereo
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
 
-    def __init__(self, voice_client, allowed_user_ids: set | None = None):
+    def __init__(self, voice_client, allowed_user_ids: set | None = None, *, pcm_callback=None):
+        if pcm_callback is not None and (not callable(pcm_callback) or not allowed_user_ids):
+            raise ValueError("Streaming PCM requires a callback and an explicit speaker allowlist")
+        self._pcm_callback = pcm_callback
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
@@ -971,6 +974,14 @@ class VoiceReceiver:
         _, _, seq, _timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
         if ssrc == self._bot_ssrc:
             return
+        # Streaming consumers must identify the sender BEFORE decode/buffering.
+        # Never use sole-member inference for a live external audio stream.
+        stream_user = None
+        if self._pcm_callback is not None:
+            with self._lock:
+                stream_user = self._ssrc_to_user.get(ssrc)
+            if stream_user is None or str(stream_user) not in self._allowed_user_ids:
+                return
         # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
         cc = first_byte & 0x0F  # CSRC count
         has_extension = bool(first_byte & 0x10)  # extension bit
@@ -1045,8 +1056,8 @@ class VoiceReceiver:
         # --- DAVE E2EE decrypt ---
         if dave_session:
             with self._lock:
-                user_id = self._ssrc_to_user.get(ssrc, 0)
-                if not user_id:
+                user_id = stream_user if self._pcm_callback is not None else self._ssrc_to_user.get(ssrc, 0)
+                if not user_id and self._pcm_callback is None:
                     # Rejoin race: SPEAKING may never be resent for a user who
                     # was already talking — try the sole-member inference
                     # before giving up on this frame.
@@ -1094,8 +1105,18 @@ class VoiceReceiver:
             pcm = self._decoders[ssrc].decode(decrypted)
             self._decode_ok += 1
             with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+                # stop() may have revoked capture while decode was in flight.
+                if not self._running or self._paused:
+                    return
+                if self._pcm_callback is not None:
+                    if self._ssrc_to_user.get(ssrc) != stream_user:
+                        return  # sender mapping changed during decode
+                    # The consumer must be synchronous/nonblocking and apply its
+                    # own lease generation gate before publishing this frame.
+                    self._pcm_callback(stream_user, pcm, time.monotonic())
+                else:
+                    self._buffers[ssrc].extend(pcm)
+                    self._last_packet_time[ssrc] = time.monotonic()
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -3788,6 +3809,21 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         """True when a continuous mixer is installed for this guild."""
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
+
+    def create_voice_stream_receiver(self, voice_client, *, allowed_user_ids, on_pcm):
+        """Create a stopped streaming receiver for a caller-owned Discord connection.
+
+        Does not join, install chained STT, bind a text channel or mutate adapter
+        voice dictionaries. The caller owns start/stop/disconnect and must revoke
+        its PCM generation before stop(). Callback runs on the receive thread.
+        """
+        if getattr(voice_client, "client", None) is not self._client:
+            raise ValueError("Voice client belongs to another Discord connection")
+        if not isinstance(allowed_user_ids, (set, frozenset)) or not allowed_user_ids:
+            raise ValueError("An explicit speaker allowlist is required")
+        if any(not isinstance(uid, str) or not uid.isdecimal() for uid in allowed_user_ids):
+            raise ValueError("Speaker IDs must be decimal strings")
+        return VoiceReceiver(voice_client, allowed_user_ids=set(allowed_user_ids), pcm_callback=on_pcm)
 
     async def join_voice_channel(self, channel, *, text_channel_id: int | None = None, source: dict | None = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the
