@@ -27,7 +27,7 @@ def project_forums(config):
     """Read the profile/session map without assuming valid YAML shapes."""
     discord = config.get("discord") if isinstance(config, Mapping) else None
     forums = discord.get("project_threads") if isinstance(discord, Mapping) else None
-    return forums if isinstance(forums, Mapping) else {}
+    return {str(key): value for key, value in forums.items()} if isinstance(forums, Mapping) else {}
 
 
 def _channel_type(channel):
@@ -142,35 +142,79 @@ async def prepare_event(runner, event):
     return None
 
 
+async def prepare_followup(runner, event, source, result):
+    """Recheck drained messages, which bypass ingress and carry fresh source objects."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.response_filters import display_kind_for_event
+
+    event = event or MessageEvent(source=source, text="")
+    with runner._profile_scope_for_source(event.source):
+        refusal = await prepare_event(runner, event)
+    if refusal is None:
+        return None
+    return {
+        "final_response": refusal, "messages": result.get("messages", []),
+        "history_offset": result.get("history_offset", 0),
+        "queued_terminal_inbound_id": str(event.message_id) if event.message_id else None,
+        "queued_terminal_display_kind": display_kind_for_event(event),
+        "queued_terminal_reply_expected": event.reply_expected,
+        "queued_terminal_source": event.source,
+        "queued_terminal_notification_category": "result",
+    }
+
+
+@contextmanager
+def background_workspace(source, task_id):
+    """Background agents own a separate terminal lane even when spawned mid-turn."""
+    from gateway.session_context import scoped_current_session_id, scoped_session_key
+    from tools.terminal_tool import clear_task_env_overrides
+
+    if not isinstance(getattr(source, "_project_thread", None), ProjectThread):
+        yield
+        return
+    with scoped_session_key(task_id), scoped_current_session_id(task_id):
+        try:
+            with turn_workspace(source, task_id):
+                yield
+        finally:
+            clear_task_env_overrides(task_id)
+
+
 @contextmanager
 def turn_workspace(source, task_id):
     """Bind context discovery and local tools; re-register only on workspace change."""
     from agent.runtime_cwd import reset_session_cwd, set_session_cwd
     from tools.terminal_scope import terminal_env
     from tools.terminal_tool import (
-        _qualify_task_key, _task_env_overrides, register_task_env_overrides,
+        _qualify_task_key, _task_env_overrides, clear_session_cwd, register_task_env_overrides,
         resolve_task_overrides, workspace_key_for,
     )
+    from tools.approval import get_current_session_key
 
     project = getattr(source, "_project_thread", None)
     if not task_id:
         yield
         return
     managed = isinstance(project, ProjectThread) and bool(project.cwd)
-    # The effective override lookup consults terminal policy for its fallback key.
-    # Unmanaged turns only need to drop a binding this hook previously owned.
+    # The registry owns the binding across events. Missing source metadata must
+    # never turn an already-managed session into an unmanaged one.
     current = (resolve_task_overrides(task_id) if managed
                else _task_env_overrides.get(_qualify_task_key(task_id), {}))
+    if not managed and current.get("cwd_source") == "project_threads":
+        project = ProjectThread("", cwd=current["cwd"])
+        managed = True
+    session_key = get_current_session_key(default="") or task_id
     local = managed and terminal_env("TERMINAL_ENV", "local").strip().lower() == "local"
     if not local:
         if current.get("cwd_source") == "project_threads":
             from gateway.session_policy import unbind_turn_workspace
-            from tools.terminal_tool import clear_session_cwd
             unbind_turn_workspace(task_id)
             clear_session_cwd(task_id)
+            clear_session_cwd(session_key)
         yield
         return
     if current.get("cwd") != project.cwd or current.get("cwd_source") != "project_threads":
+        clear_session_cwd(session_key)
         register_task_env_overrides(task_id, {
             **current, "cwd": project.cwd, "cwd_source": "project_threads",
             "workspace_key": workspace_key_for(project.cwd),

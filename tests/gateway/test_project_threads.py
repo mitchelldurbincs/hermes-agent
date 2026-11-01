@@ -199,19 +199,22 @@ def test_project_binding_does_not_override_docker_policy(configured_home):
 
 def test_local_binding_is_removed_on_backend_change(configured_home):
     from gateway.project_threads import turn_workspace
+    from gateway.session_context import scoped_session_key
     from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
     from tools.terminal_tool import clear_task_env_overrides, get_session_cwd, record_session_cwd, resolve_task_overrides
     source = SimpleNamespace(_project_thread=ProjectThread("100", "xunning", str(configured_home)))
     local_token = set_terminal_scope({"TERMINAL_ENV": "local"})
     try:
-        with turn_workspace(source, "backend-change"):
+        with scoped_session_key("backend-key"), turn_workspace(source, "backend-change"):
             assert resolve_task_overrides("backend-change")["cwd"] == str(configured_home)
             record_session_cwd("backend-change", str(configured_home / "child"))
+            record_session_cwd("backend-key", str(configured_home / "child"))
         docker_token = set_terminal_scope({"TERMINAL_ENV": "docker"})
         try:
-            with turn_workspace(source, "backend-change"):
+            with scoped_session_key("backend-key"), turn_workspace(source, "backend-change"):
                 assert resolve_task_overrides("backend-change") == {}
                 assert get_session_cwd("backend-change") is None
+                assert get_session_cwd("backend-key") is None
         finally:
             reset_terminal_scope(docker_token)
     finally:
@@ -236,6 +239,7 @@ async def test_starter_permission_failure_refuses_before_model(configured_home):
 
 def test_workspace_change_rebinds_only_own_thread(configured_home, tmp_path):
     from gateway.project_threads import turn_workspace
+    from gateway.session_context import scoped_session_key
     from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
     from tools.terminal_tool import clear_task_env_overrides, terminal_tool, cleanup_all_environments
     first, second = _event(_channel()), _event(_channel(thread_id=300))
@@ -245,14 +249,14 @@ def test_workspace_change_rebinds_only_own_thread(configured_home, tmp_path):
     assert first_key != second_key
     token = set_terminal_scope({"TERMINAL_ENV": "local"})
     try:
-        with turn_workspace(first.source, first_key):
+        with scoped_session_key("first-session-key"), turn_workspace(first.source, first_key):
             assert json.loads(terminal_tool("pwd", task_id=first_key))["output"].strip() == str(configured_home)
-        with turn_workspace(second.source, second_key):
+        with scoped_session_key("second-session-key"), turn_workspace(second.source, second_key):
             assert json.loads(terminal_tool("pwd", task_id=second_key))["output"].strip() == str(tmp_path)
         first.source._project_thread = ProjectThread("100", "xunning", str(configured_home / "child"))
-        with turn_workspace(first.source, first_key):
+        with scoped_session_key("first-session-key"), turn_workspace(first.source, first_key):
             assert json.loads(terminal_tool("pwd", task_id=first_key))["output"].strip() == str(configured_home / "child")
-        with turn_workspace(second.source, second_key):
+        with scoped_session_key("second-session-key"), turn_workspace(second.source, second_key):
             assert json.loads(terminal_tool("pwd", task_id=second_key))["output"].strip() == str(tmp_path)
     finally:
         cleanup_all_environments()
@@ -298,3 +302,174 @@ def test_unmanaged_turn_does_not_read_terminal_policy():
             pass
     finally:
         reset_terminal_scope(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title,expected", [("[project:xunning]", None), ("[project:missing]", GUIDANCE)])
+async def test_integer_yaml_forum_key_binds_and_refuses(configured_home, title, expected):
+    import hermes_yaml as yaml
+
+    config = {"discord": {"project_threads": {100: {"xunning": {"cwd": str(configured_home)}}}}}
+    (configured_home.parent / "profile" / "config.yaml").write_text(yaml.safe_dump(config))
+    event = _event(_channel(title))
+    assert await prepare_event(SimpleNamespace(), event) == expected
+    assert event.source._project_thread.forum_id == "100"
+
+
+@pytest.fixture
+def local_project_tools(configured_home):
+    from tools import terminal_tool
+    from tools.file_tools import clear_file_ops_cache
+    from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
+
+    token = set_terminal_scope({"TERMINAL_ENV": "local", "TERMINAL_CWD": str(configured_home.parent)})
+    try:
+        yield
+    finally:
+        terminal_tool.cleanup_all_environments()
+        for task_id in ("followup-turn", "background-turn"):
+            terminal_tool.clear_task_env_overrides(task_id)
+            clear_file_ops_cache(task_id)
+        reset_terminal_scope(token)
+
+
+def _assert_project_tools(task_id, workspace):
+    from agent.runtime_cwd import resolve_context_cwd
+    from tools.file_tools import read_file_tool
+    from tools.terminal_tool import terminal_tool
+
+    assert resolve_context_cwd() == workspace
+    assert json.loads(terminal_tool("pwd", task_id=task_id))["output"].strip() == str(workspace)
+    contents = json.loads(read_file_tool("marker.txt", task_id=task_id))
+    assert "project file" in contents.get("content", ""), contents
+
+
+def _followup_runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._run_agent_deliver_first_response = AsyncMock()
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="pwd")
+    runner._persist_prompt_pins = AsyncMock()
+    runner._pinned_channel_inputs = lambda key, prompt, source, **kw: (prompt, source)
+    runner._session_key_for_source = build_session_key
+    runner._is_goal_continuation_event = lambda event: False
+    runner._delivery_adapter_for = lambda source: None
+    runner._intake_adapter_for = lambda source: None
+    return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted,initial_commands", [(False, ["pwd"]), (True, [])])
+async def test_drained_followup_rechecks_fresh_source_and_binds(
+    local_project_tools, configured_home, interrupted, initial_commands,
+):
+    from gateway.project_threads import turn_workspace
+    from gateway.session_context import scoped_session_key
+    from gateway.turn_context import TurnContext
+    from tools.terminal_tool import terminal_tool
+
+    first, pending = _event(_channel()), _event(_channel())
+    runner = _followup_runner()
+    assert await prepare_event(runner, first) is None
+    key = build_session_key(first.source)
+    ctx = TurnContext(source=first.source, session_id="followup-turn", session_key=key, history=[])
+
+    async def run_followup(**kwargs):
+        with turn_workspace(kwargs["source"], kwargs["session_id"]):
+            _assert_project_tools(kwargs["session_id"], configured_home)
+        return {"final_response": "follow-up complete", "messages": []}
+
+    runner._run_agent = AsyncMock(side_effect=run_followup)
+    with scoped_session_key(key):
+        with turn_workspace(first.source, ctx.session_id):
+            for command in initial_commands:
+                assert json.loads(terminal_tool(command, task_id=ctx.session_id))["output"].strip() == str(configured_home)
+        result = await runner._run_agent_queued_followup(
+            ctx, None, pending.text, pending, {}, {"messages": [], "interrupted": interrupted}, None)
+    assert result["final_response"] == "follow-up complete"
+    runner._run_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_drained_followup_refuses_changed_tag_before_model(local_project_tools, configured_home, interrupted):
+    from gateway.project_threads import turn_workspace
+    from gateway.session_context import scoped_session_key
+    from gateway.turn_context import TurnContext
+
+    first, pending = _event(_channel()), _event(_channel("[project:missing]"))
+    pending.message_id = "refused-followup"
+    runner = _followup_runner()
+    runner._run_agent = AsyncMock()
+    assert await prepare_event(runner, first) is None
+    key = build_session_key(first.source)
+    ctx = TurnContext(source=first.source, session_id="followup-turn", session_key=key, history=[])
+    with scoped_session_key(key):
+        with turn_workspace(first.source, ctx.session_id):
+            _assert_project_tools(ctx.session_id, configured_home)
+        result = await runner._run_agent_queued_followup(
+            ctx, None, pending.text, pending, {},
+            {"messages": [], "interrupted": interrupted, "already_sent": True}, None)
+    assert result["final_response"] == GUIDANCE
+    assert not result.get("already_sent")
+    assert result["queued_terminal_inbound_id"] == pending.message_id
+    runner._run_agent.assert_not_called()
+    runner._prepare_profile_scoped_inbound_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_source_without_project_metadata_keeps_registered_binding(local_project_tools, configured_home):
+    from gateway.project_threads import turn_workspace
+    from gateway.session_context import scoped_session_key
+
+    event = _event(_channel())
+    assert await prepare_event(SimpleNamespace(), event) is None
+    with scoped_session_key(build_session_key(event.source)):
+        with turn_workspace(event.source, "followup-turn"):
+            pass
+        with turn_workspace(_event(_channel()).source, "followup-turn"):
+            _assert_project_tools("followup-turn", configured_home)
+
+
+@pytest.mark.asyncio
+async def test_background_agent_binds_project_before_construction_and_tools(
+    local_project_tools, configured_home, monkeypatch,
+):
+    from agent.runtime_cwd import resolve_context_cwd
+    from gateway.run import GatewayRunner
+    from gateway.session_context import scoped_session_key
+    from tools.terminal_tool import get_session_cwd, record_session_cwd, resolve_task_overrides
+    import sys
+
+    event = _event(_channel())
+    assert await prepare_event(SimpleNamespace(), event) is None
+    runner = _gateway_runner()
+    adapter = AsyncMock()
+    adapter.extract_media = lambda response: ([], response)
+    adapter.extract_images = lambda response: ([], response)
+    runner._delivery_adapter_for.return_value = adapter
+    runner._resolve_session_agent_runtime.return_value = ("test-model", {"api_key": "fake"})
+    runner._resolve_turn_toolsets.return_value = ([], None)
+    runner._get_executor.return_value = None
+    constructed = []
+
+    class BackgroundAgent:
+        def __init__(self, **kwargs):
+            constructed.append(resolve_context_cwd())
+
+        def run_conversation(self, *, user_message, task_id):
+            _assert_project_tools(task_id, configured_home)
+            return {"final_response": "background complete", "messages": []}
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=BackgroundAgent))
+    runner._run_in_executor_with_context = GatewayRunner._run_in_executor_with_context.__get__(runner)
+    key = build_session_key(event.source)
+    record_session_cwd(key, str(configured_home / "child"))
+    with scoped_session_key(key):
+        await GatewayRunner._run_background_task_inner(runner, "fix the failing test", event.source, "background-turn")
+    assert constructed == [configured_home]
+    assert "background complete" in adapter.send.call_args.kwargs["content"]
+    assert get_session_cwd(key) == str(configured_home / "child")
+    assert resolve_task_overrides("background-turn") == {}
