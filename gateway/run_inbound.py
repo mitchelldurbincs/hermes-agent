@@ -1243,6 +1243,19 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             raise RuntimeStoreError('profile_mismatch')
         return False, None
 
+    async def _hm_pre_dispatch(self, event, is_internal, live_voice_request):
+        """Authorized request checks before controls, durable admission or model work."""
+        if live_voice_request is not None:
+            live_voice_request.validate_admitted(event)
+        from gateway.project_threads import prepare_event
+        refusal = await prepare_event(self, event)
+        if refusal is not None:
+            return refusal
+        if not is_internal:
+            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
+            record_gateway_slash_command(event)
+        return None
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
@@ -1253,11 +1266,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
-        if _live_voice_request is not None:
-            _live_voice_request.validate_admitted(event)  # after normal authorization, before controls/admission
-        if not is_internal:
-            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
-            record_gateway_slash_command(event)
+        if (refusal := await self._hm_pre_dispatch(event, is_internal, _live_voice_request)) is not None:
+            return refusal
         # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
         # not on the adapter's raw inbound: profile routing, the ignored-channel
         # guard, plugin hooks and user authorization all reject events above,
