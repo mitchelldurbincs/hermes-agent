@@ -231,7 +231,7 @@ def row_turn_author(policy, row):
 
 
 async def execute_admission(authority, ref, row):
-    from gateway.voice_requests import request_for_row, _executing, LiveRequestRefused
+    from gateway.voice_requests import request_for_row, _executing
     live_voice_request = request_for_row(authority, ref, row)
     from gateway.session_completion_notes import note_if_unviewed
     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
@@ -246,8 +246,6 @@ async def execute_admission(authority, ref, row):
     from gateway.session_managed_worker import managed_policy, admit_managed
     policy = managed_policy(authority, ref)
     if policy is not None:
-        if live_voice_request is not None:
-            raise LiveRequestRefused("live_voice_managed_worker_not_supported")
         return await admit_managed(authority, ref, row, policy)
     live = authority.sessions[ref.session_id]
     native = row['admission_id'] in authority.native_waiters

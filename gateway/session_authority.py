@@ -552,9 +552,8 @@ class SessionAuthority:
         import json
         from gateway.session_envelope import prepare_native, restore_native_source
         self._require_admission_open()
-        from gateway.voice_requests import request_for_event
-        if live_voice_request := request_for_event(event):
-            live_voice_request.validate_admitted(event)
+        from gateway.voice_requests import admitted_check
+        admitted_check(event)(event)  # a live voice request is re-validated right before its commit
         payload = await prepare_native(self.runner, event)
         if fingerprint := getattr(event, '_ingress_sha256', None):
             payload['native_text_v1']['ingress_sha256'] = fingerprint  # the delivery before a rewrite

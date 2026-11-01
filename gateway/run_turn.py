@@ -1291,9 +1291,6 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         # This avoids a cross-scope NameError: the outer interrupt / finalisation paths reference the
         # consumer via ``streaming_tts_consumer_holder[0]``. Gates: voice input, auto-TTS enabled for this
         # chat, adapter supports streaming, and a usable streaming TTS provider configured. See #60671.
-        from gateway.voice_requests import executing_for
-        if executing_for(source):
-            return  # GPT-Live supplies speech; never pay for chained streaming TTS too.
         _stts_adapter = self._delivery_adapter_for(source)
         _is_voice_input = (
             message_type is not None

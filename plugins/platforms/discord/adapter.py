@@ -948,6 +948,7 @@ class VoiceReceiver:
 
     # --- Packet handler (called from SocketReader thread) ---
 
+    # health: allow CC -- fork overlay: the PCM stream's two inline exits (drop an unknown sender before decrypt, hand a frame off instead of buffering); the rest is in _stream_sender/_publish_stream_frame so upstream's lines stay untouched
     def _on_packet(self, data: bytes):
         if not self._running or self._paused:
             return
@@ -974,14 +975,10 @@ class VoiceReceiver:
         _, _, seq, _timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
         if ssrc == self._bot_ssrc:
             return
-        # Streaming consumers must identify the sender BEFORE decode/buffering.
-        # Never use sole-member inference for a live external audio stream.
-        stream_user = None
-        if self._pcm_callback is not None:
-            with self._lock:
-                stream_user = self._ssrc_to_user.get(ssrc)
-            if stream_user is None or str(stream_user) not in self._allowed_user_ids:
-                return
+        # Streaming consumers identify the sender BEFORE decrypt/decode, never by sole-member inference.
+        stream_user = self._stream_sender(ssrc)
+        if self._pcm_callback is not None and stream_user is None:
+            return
         # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
         cc = first_byte & 0x0F  # CSRC count
         has_extension = bool(first_byte & 0x10)  # extension bit
@@ -1056,8 +1053,8 @@ class VoiceReceiver:
         # --- DAVE E2EE decrypt ---
         if dave_session:
             with self._lock:
-                user_id = stream_user if self._pcm_callback is not None else self._ssrc_to_user.get(ssrc, 0)
-                if not user_id and self._pcm_callback is None:
+                user_id = stream_user or self._ssrc_to_user.get(ssrc, 0)
+                if not user_id:
                     # Rejoin race: SPEAKING may never be resent for a user who
                     # was already talking — try the sole-member inference
                     # before giving up on this frame.
@@ -1104,24 +1101,34 @@ class VoiceReceiver:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
             self._decode_ok += 1
+            if self._pcm_callback is not None:
+                return self._publish_stream_frame(ssrc, stream_user, pcm)
             with self._lock:
-                # stop() may have revoked capture while decode was in flight.
-                if not self._running or self._paused:
-                    return
-                if self._pcm_callback is not None:
-                    if self._ssrc_to_user.get(ssrc) != stream_user:
-                        return  # sender mapping changed during decode
-                    # The consumer must be synchronous/nonblocking and apply its
-                    # own lease generation gate before publishing this frame.
-                    self._pcm_callback(stream_user, pcm, time.monotonic())
-                else:
-                    self._buffers[ssrc].extend(pcm)
-                    self._last_packet_time[ssrc] = time.monotonic()
+                self._buffers[ssrc].extend(pcm)
+                self._last_packet_time[ssrc] = time.monotonic()
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
             return
+
+    def _stream_sender(self, ssrc: int):
+        """Streaming mode: the explicitly allowlisted user SPEAKING mapped to ``ssrc``, else None."""
+        if self._pcm_callback is None:
+            return None
+        with self._lock:
+            user = self._ssrc_to_user.get(ssrc)
+        return user if user and str(user) in self._allowed_user_ids else None
+
+    def _publish_stream_frame(self, ssrc: int, user, pcm: bytes) -> None:
+        """Hand one decoded frame to the streaming consumer OUTSIDE the receiver lock, so the
+        callback may stop() or remap without deadlocking the receive thread. A frame whose capture
+        was stopped/paused or whose sender changed during decode is dropped; the consumer still
+        gates each frame on its own lease generation (stop() flips ``_running`` without the lock)."""
+        with self._lock:
+            current = self._running and not self._paused and self._ssrc_to_user.get(ssrc) == user
+        if current:
+            self._pcm_callback(user, pcm, time.monotonic())
 
     # --- Silence detection ---
 
@@ -3824,6 +3831,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if any(not isinstance(uid, str) or not uid.isdecimal() for uid in allowed_user_ids):
             raise ValueError("Speaker IDs must be decimal strings")
         return VoiceReceiver(voice_client, allowed_user_ids=set(allowed_user_ids), pcm_callback=on_pcm)
+
+    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
+        # A live voice request's speech comes from GPT-Live: never pay for chained auto-TTS too.
+        from gateway.voice_requests import speaks_for_chat
+        return not speaks_for_chat(chat_id) and super()._should_auto_tts_for_chat(chat_id)
 
     async def join_voice_channel(self, channel, *, text_channel_id: int | None = None, source: dict | None = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the

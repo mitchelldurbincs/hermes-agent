@@ -8,11 +8,15 @@ There is no direct AIAgent call, new credential loader, or adapter monkeypatch.
 import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass
+import logging
 import threading
 from types import SimpleNamespace
 import uuid
 
+logger = logging.getLogger(__name__)
+
 PREFIX = "appliance_voice_"
+# Dispatched requests whose handler is still running: the lease every ingress/execution check looks up.
 _requests = {}
 _lock = threading.RLock()
 _executing = ContextVar("appliance_live_voice_request", default=None)
@@ -126,15 +130,15 @@ def prepare_request(runner, adapter, *, binding, context, is_current, allow_gate
         raw_message=SimpleNamespace(guild_id=int(value.guild_id), guild=None),
         internal=False, allow_gateway_control=False,
     )
-    handle = LiveVoiceRequest(runner, adapter, value, event, is_current)
-    with _lock:
-        if len(_requests) >= 128:
-            raise LiveRequestRefused("unresolved_voice_request_limit")
-        _requests[handle.request_id] = handle
-    return handle
+    return LiveVoiceRequest(runner, adapter, value, event, is_current)
 
 
 def request_for_event(event):
+    """The live voice request *event* carries, or None; a missing or revoked lease refuses.
+
+    The source is not checked here: the drain restores an execution's event without its routing
+    identity until admission canonicalizes it, so callers validate after that (``admitted_check``).
+    """
     request_id = getattr(event, "message_id", None)
     if not isinstance(request_id, str) or not request_id.startswith(PREFIX):
         return None
@@ -143,8 +147,19 @@ def request_for_event(event):
     if handle is None:
         # Never replay a paid voice turn after restart or loss of its live audience.
         raise LiveRequestRefused("live_voice_request_lease_missing")
-    handle.validate(event)
+    handle.check_current()
     return handle
+
+
+def _no_check(_event):
+    return None
+
+
+def admitted_check(event):
+    """Look *event*'s lease up now; the returned check validates the admitted event (no-op for
+    any other event), once identity is canonicalized and before controls or admission."""
+    handle = request_for_event(event)
+    return _no_check if handle is None else handle.validate_admitted
 
 
 def request_for_row(authority, ref, row):
@@ -157,18 +172,24 @@ def request_for_row(authority, ref, row):
             or handle.admission_id != row["admission_id"]):
         raise LiveRequestRefused("live_voice_request_lease_missing")
     handle.check_current()
+    from gateway.session_managed_worker import managed_policy
+    if managed_policy(authority, ref) is not None:
+        raise LiveRequestRefused("live_voice_managed_worker_not_supported")
     return handle
 
 
 def committed(authority, ref, event, row):
-    # Called by the existing ordered writer BEFORE it schedules this admission.
+    # Called by the ordered writer AFTER the row committed, BEFORE its drain is scheduled. Never
+    # raise: tracked_write skips that scheduling when this callback fails, stranding the row.
     request_id = getattr(event, "message_id", None)
     if not isinstance(request_id, str) or not request_id.startswith(PREFIX):
         return
     with _lock:
         handle = _requests.get(request_id)
         if handle is None:
-            raise LiveRequestRefused("live_voice_request_lease_missing")
+            # Its dispatch already ended; request_for_row refuses the row when it executes.
+            logger.warning("Live voice request %s committed without its lease; it will be refused", request_id)
+            return
         handle.authority, handle.ref, handle.admission_id = authority, ref, row["admission_id"]
         handle.actor = _actor(authority, row)
         # Cancellation can precede this shielded durable commit. The execution
@@ -191,6 +212,13 @@ def executing_for(source):
     b = handle.binding
     return (source.profile, source.guild_id, source.chat_id, source.user_id) == (
         b.profile, b.guild_id, b.text_channel_id, b.owner_id)
+
+
+def speaks_for_chat(chat_id):
+    """Whether the executing turn is a live voice request answering in *chat_id*: GPT-Live supplies
+    its speech, so the chat's chained auto-TTS must not run for it."""
+    handle = _executing.get()
+    return handle is not None and handle.binding.text_channel_id == str(chat_id)
 
 
 class LiveVoiceRequest:
@@ -228,16 +256,20 @@ class LiveVoiceRequest:
 
     async def run(self):
         self.validate(self.event)
-        if self.task is not None:
-            raise LiveRequestRefused("live_voice_request_already_started")
         # This is the adapter's ALREADY WIRED handler, including its normal
         # native_callback + profile scope. BaseAdapter's fire-and-forget delivery
         # lifecycle is intentionally not used for a duplex request/result API.
         handler = getattr(self.adapter, "_message_handler", None)
         if not callable(handler):
             raise LiveRequestRefused("profile_scoped_message_handler_missing")
-        self.task = asyncio.create_task(handler(self.event))
-        self.task.add_done_callback(self._observe_outcome)
+        with _lock:
+            if self.task is not None or self.request_id in _requests:
+                raise LiveRequestRefused("live_voice_request_already_started")
+            if len(_requests) >= 128:
+                raise LiveRequestRefused("unresolved_voice_request_limit")
+            _requests[self.request_id] = self
+            self.task = asyncio.create_task(handler(self.event))
+        self.task.add_done_callback(self._dispatch_done)
         try:
             await asyncio.shield(self.task)
             return await self.result()
@@ -245,6 +277,14 @@ class LiveVoiceRequest:
             self.cancelled.set()
             self._schedule_cancel()
             raise
+
+    def _dispatch_done(self, task):
+        # The handler returns once its row is settled, refused or never committed: the lease ends
+        # with it on every path, and a later execution of the row is refused (request_for_row).
+        with _lock:
+            if _requests.get(self.request_id) is self:
+                del _requests[self.request_id]
+        self._observe_outcome(task)
 
     @staticmethod
     def _observe_outcome(task):
@@ -268,8 +308,6 @@ class LiveVoiceRequest:
         if not isinstance(text, str) or len(text.encode()) > 12_000:
             raise LiveRequestRefused("voice_result_missing_or_oversized")
         self.check_current()
-        with _lock:
-            _requests.pop(self.request_id, None)
         return {"text": text, "usage": saved.get("usage", {}), "admission_id": self.admission_id}
 
     def _schedule_cancel(self):
@@ -279,28 +317,20 @@ class LiveVoiceRequest:
 
     async def cancel(self):
         self.cancelled.set()  # gate first, before any await or late writer commit
-        if self.task is None and self.authority is None:
-            with _lock:
-                _requests.pop(self.request_id, None)
-            return True  # prepared only: no dispatcher or writer ever started
         if self.authority is None:
-            return False  # the commit callback will cancel a late admitted row
+            # Prepared only (True): nothing was dispatched. Otherwise the commit callback cancels
+            # a late admitted row; the lease ends with the dispatch either way (_dispatch_done).
+            return self.task is None
         receipt = await self.authority.receipt(self.actor, self.ref, self.admission_id)
         if receipt.status == "queued":
             claimed = await self.authority.cancel_or_claimed(self.actor, self.ref, self.admission_id)
             if claimed is None:
-                with _lock:
-                    _requests.pop(self.request_id, None)
                 return True
             generation = claimed["generation"]
         elif receipt.status == "started":
             generation = receipt.execution_generation
-        elif receipt.status == "terminal":
-            with _lock:
-                _requests.pop(self.request_id, None)
-            return True
         else:
-            return False
+            return receipt.status == "terminal"
         if type(generation) is not int:
             return False
         # CAS generation checking in Hermes refuses if a newer turn took over.
