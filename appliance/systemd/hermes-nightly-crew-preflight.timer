@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes crew preflight at 02:55 Eastern
+
+[Timer]
+OnCalendar=*-*-* 02:55:00 America/New_York
+Persistent=false
+RandomizedDelaySec=0
+Unit=hermes-nightly-crew-preflight.service
+
+[Install]
+WantedBy=timers.target

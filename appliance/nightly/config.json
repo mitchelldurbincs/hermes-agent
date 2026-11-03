@@ -1,0 +1,21 @@
+{
+  "repo": "/home/aspect/.hermes/hermes-agent",
+  "branch": "aspecttech",
+  "state": "/home/aspect/appliance/state/hermes-nightly",
+  "integrated_upstream": "0aab6dcf8b7869acbab06507c34881b53036c09a",
+  "pins": "/home/aspect/appliance/nightly/pins.json",
+  "planner": "/home/aspect/appliance/lib/nightly_crew.py",
+  "gates": "/home/aspect/appliance/scripts/nightly_crew_gates.py",
+  "python": "/usr/bin/python3",
+  "bootstrap_python": "/usr/bin/python3",
+  "promotion_enabled": true,
+  "compat_patch": "/home/aspect/appliance/nightly/retirement-compat.patch",
+  "compat_sha256": "022c852097ba6e91c4c3855eab07cca392e0d0cb47a89c41a2dce8b49694c4f0",
+  "escalation_command": [
+    "/home/aspect/.local/bin/hermes",
+    "send",
+    "--to",
+    "discord:aspectcisco"
+  ],
+  "mirror_repo": "/home/aspect/appliance/state/hermes-mirror"
+}

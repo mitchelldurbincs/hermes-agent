@@ -35,3 +35,6 @@ docker/entrypoint.sh text eol=lf
 *.html  text eol=lf
 *.svg   text eol=lf
 *.ps1   text eol=crlf
+
+# Unified patches encode empty context lines as a single space.
+appliance/nightly/retirement-compat.patch whitespace=-blank-at-eol

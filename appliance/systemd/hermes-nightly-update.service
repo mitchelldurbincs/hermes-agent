@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes approved-candidate consumer (HOLD without green referee receipt)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/aspect/appliance/scripts/hermes-nightly-update.sh
+TimeoutStartSec=300
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,8 @@
+[Unit]
+Description=Deliver coalesced third-night Hermes incidents to Mitchell
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/aspect/appliance/scripts/nightly_crew_queue.py --config /home/aspect/appliance/nightly/config.json
+TimeoutStartSec=120
+KillMode=control-group

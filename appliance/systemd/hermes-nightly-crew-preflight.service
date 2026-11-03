@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes crew nightly merge rehearsal and gate receipts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/aspect/appliance/scripts/nightly_crew_preflight.py --config /home/aspect/appliance/nightly/config.json
+ExecStopPost=/usr/bin/python3 /home/aspect/appliance/scripts/nightly_crew_preflight.py --config /home/aspect/appliance/nightly/config.json --record-exit
+TimeoutStartSec=1500
+KillMode=control-group
+SuccessExitStatus=2
+StandardOutput=journal
+StandardError=journal

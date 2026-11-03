@@ -159,6 +159,8 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
     ``walked_from`` is the stored session a Responses/Runs chain continued from when the chain moved
     past it to *session_id* (``continued_api_session``): the fences it passed stay for good. If one
     aged out since that lookup, the bind refuses with the retryable ``chain_moved``."""
+    from gateway.session_retirement_compat import install_retirement
+    install_retirement(authority)
     authority._require_admission_open()
     if not isinstance(session_id, str) or not session_id or _is_path_unsafe(session_id):
         raise RuntimeStoreError('invalid_params')
@@ -298,6 +300,8 @@ def api_storage_source(db, session_id, fallback):
 
 
 def restore_api_session(authority, session_id):
+    from gateway.session_retirement_compat import install_retirement
+    install_retirement(authority)
     from gateway.session_authority import LiveSession
     with authority.db._read_ctx() as conn:
         saved = conn.execute('SELECT value FROM state_meta WHERE key=?',

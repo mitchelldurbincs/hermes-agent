@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes receipt-only promotion at 03:33 Eastern
+
+[Timer]
+OnCalendar=*-*-* 03:33:00 America/New_York
+Persistent=false
+RandomizedDelaySec=0
+Unit=hermes-nightly-update.service
+
+[Install]
+WantedBy=timers.target

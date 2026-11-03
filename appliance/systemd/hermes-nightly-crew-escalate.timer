@@ -1,0 +1,10 @@
+[Unit]
+Description=Hermes blocked incident dispatch at 08:00 Eastern
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 America/New_York
+Persistent=false
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target
