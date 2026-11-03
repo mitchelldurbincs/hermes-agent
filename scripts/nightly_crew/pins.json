@@ -1,0 +1,9 @@
+{
+  "gateway/run_inbound.py": "7eeae307fcb899fb8021b6c8d07e8d8bdd00b3c7351269426b1ebbc81dd61b39",
+  "gateway/run_turn.py": "77bf8955b49a4f9634a6ea41d1ff68734cfdb62035bf06d8216f98c572ca9df6",
+  "gateway/run_turn_persistence.py": "6c8c2fe430cd455ad61ad390ba2c829d71a3e988a4b0891d47d791fe7ff7eba2",
+  "gateway/run_voice.py": "4ba5c445ad232b8a5fdc70b57852e3de4b21dbd272b1a87cd9125b2cf23572f6",
+  "gateway/session_authority.py": "6c41d35a1f498141cc5eebdf764331db9713bb0f7419277ae5abf56e2ef152d7",
+  "gateway/session_ingress.py": "78b15565f9be13ac09781d03c8d6d53576c8619c4dd562b621574ffbdd2e9ff0",
+  "plugins/platforms/discord/adapter.py": "322efd6a9dee60917d3fee627657bdcb47b35920988e15fa2a6669077e906fbe"
+}
